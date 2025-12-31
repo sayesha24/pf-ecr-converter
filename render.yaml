@@ -1,7 +1,6 @@
 services:
   - type: web
     name: pf-ecr-converter
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    runtime: docker
     plan: free
+    healthCheckPath: /health

@@ -1,29 +1,45 @@
 """
 PF ECR Converter - Web Interface (Single File Version)
 Features:
-  1. Convert ECR PDF to Excel
+  1. Convert ECR PDF to Excel (with OCR support for rotated PDFs)
   2. Convert Excel to CSV
 
 Usage:
-    1. Install dependencies: pip3 install flask pdfplumber openpyxl pandas
-    2. Run: python3 pf_ecr_web_app.py
-    3. Open browser: http://localhost:5000
+    1. Install dependencies: pip3 install flask pdfplumber openpyxl pandas pymupdf pytesseract pillow
+    2. Install Tesseract OCR: 
+       - Mac: brew install tesseract
+       - Ubuntu: sudo apt-get install tesseract-ocr
+    3. Run: python3 pf_ecr_web_app.py
+    4. Open browser: http://localhost:5000
 """
 
 from flask import Flask, request, make_response
 import pdfplumber
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 import pandas as pd
 import re
 import os
 import tempfile
-import csv
-import io
 from werkzeug.utils import secure_filename
+
+# OCR imports (optional - for rotated PDFs)
+try:
+    import fitz  # PyMuPDF
+    import pytesseract
+    from PIL import Image
+    import io
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 app = Flask(__name__)
 app.secret_key = 'pf_ecr_converter_secret_key_2025'
+
+# Health check route
+@app.route('/health')
+def health():
+    return 'OK', 200
 
 # Embedded HTML template
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -54,7 +70,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         h1 { color: #333; text-align: center; margin-bottom: 10px; font-size: 24px; }
         .subtitle { color: #666; text-align: center; margin-bottom: 25px; font-size: 14px; }
         
-        /* Tab Styles */
         .tabs {
             display: flex;
             margin-bottom: 25px;
@@ -81,7 +96,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
         .tab:hover:not(.active) { background: #f0f2ff; }
         
-        /* Tab Content */
         .tab-content { display: none; }
         .tab-content.active { display: block; }
         
@@ -159,7 +173,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <h1>📄 PF ECR Converter</h1>
         <p class="subtitle">Convert your PF ECR files easily</p>
         
-        <!-- Tabs -->
         <div class="tabs">
             <button class="tab active" onclick="switchTab('pdf-to-excel', this)">PDF → Excel</button>
             <button class="tab" onclick="switchTab('excel-to-csv', this)">Excel → CSV</button>
@@ -167,7 +180,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         {{ERROR_MESSAGE}}
 
-        <!-- PDF to Excel Tab -->
         <div class="tab-content active" id="pdf-to-excel">
             <form method="POST" enctype="multipart/form-data" id="pdfForm">
                 <input type="hidden" name="conversion_type" value="pdf_to_excel">
@@ -191,14 +203,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <h3>PDF to Excel features:</h3>
                 <ul>
                     <li>Extracts member data from ECR PDF</li>
+                    <li>Supports both normal and rotated PDFs</li>
                     <li>Removes name columns (ECR & UAN Repository)</li>
                     <li>Cleans numeric formatting</li>
-                    <li>Preserves # prefix for deferred pension</li>
                 </ul>
             </div>
         </div>
 
-        <!-- Excel to CSV Tab -->
         <div class="tab-content" id="excel-to-csv">
             <form method="POST" enctype="multipart/form-data" id="excelForm">
                 <input type="hidden" name="conversion_type" value="excel_to_csv">
@@ -222,7 +233,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <h3>Excel to CSV features:</h3>
                 <ul>
                     <li>Converts Excel (.xlsx, .xls) to CSV</li>
-                    <li>Preserves all data from first sheet</li>
+                    <li>Removes commas from numbers</li>
                     <li>UTF-8 encoding for proper character support</li>
                     <li>Compatible with any spreadsheet software</li>
                 </ul>
@@ -231,16 +242,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
 
     <script>
-        // Tab switching
         function switchTab(tabId, btn) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            
             document.getElementById(tabId).classList.add('active');
             btn.classList.add('active');
         }
 
-        // File handling for both forms
         function setupForm(num) {
             const dropZone = document.getElementById('dropZone' + num);
             const fileInput = document.getElementById('fileInput' + num);
@@ -288,7 +296,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             document.getElementById('convertBtn' + num).disabled = true;
         }
 
-        // Initialize both forms
         setupForm(1);
         setupForm(2);
     </script>
@@ -323,8 +330,8 @@ def clean_number(value):
         return value
 
 
-def extract_ecr_data(pdf_path):
-    """Extract member data from ECR PDF."""
+def extract_ecr_data_pdfplumber(pdf_path):
+    """Extract member data from ECR PDF using pdfplumber (for normal PDFs)."""
     all_data = []
     
     with pdfplumber.open(pdf_path) as pdf:
@@ -343,13 +350,110 @@ def extract_ecr_data(pdf_path):
     return all_data
 
 
+def extract_ecr_data_ocr(pdf_path):
+    """Extract member data from ECR PDF using OCR (for rotated/vectorized PDFs)."""
+    if not OCR_AVAILABLE:
+        return []
+    
+    all_data = []
+    doc = fitz.open(pdf_path)
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # Render page to image at high resolution
+        mat = fitz.Matrix(2.5, 2.5)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        
+        # Try rotations to find the right orientation
+        for rotation in [0, -90, 90, 180]:
+            if rotation != 0:
+                img_to_ocr = img.rotate(rotation, expand=True)
+            else:
+                img_to_ocr = img
+            
+            # Run OCR
+            text = pytesseract.image_to_string(img_to_ocr)
+            
+            # Find all 12-digit UAN numbers
+            uans_found = re.findall(r'\b\d{12}\b', text)
+            
+            if len(uans_found) >= 3:  # Found meaningful data
+                # Parse the text line by line
+                lines = text.split('\n')
+                
+                for line in lines:
+                    # Look for UAN pattern (12 digits)
+                    uan_match = re.search(r'\b(\d{12})\b', line)
+                    if uan_match:
+                        uan = uan_match.group(1)
+                        
+                        # Find serial number before UAN
+                        before_uan = line[:uan_match.start()]
+                        sl_match = re.search(r'(\d{1,3})\s*[|\s]*$', before_uan)
+                        sl_no = sl_match.group(1) if sl_match else str(len(all_data) + 1)
+                        
+                        # Find all numbers after UAN (wages, contributions, etc.)
+                        after_uan = line[uan_match.end():]
+                        # Extract numbers (with commas, decimals, or plain)
+                        numbers = re.findall(r'[\d,]+\.?\d*', after_uan)
+                        
+                        # Clean numbers - remove commas
+                        clean_numbers = []
+                        for num in numbers:
+                            cleaned = num.replace(',', '')
+                            if cleaned and cleaned.replace('.', '').isdigit():
+                                clean_numbers.append(cleaned)
+                        
+                        # Build row: need at least Gross, EPF, EPS, EDLI, EE, EPS, ER
+                        if len(clean_numbers) >= 7:
+                            row = [None] * 17
+                            row[0] = sl_no  # Sl. No.
+                            row[1] = uan    # UAN
+                            row[2] = None   # Name ECR (skip)
+                            row[3] = None   # Name UAN (skip)
+                            
+                            # Map numbers to columns
+                            # clean_numbers[0] = Gross, [1]=EPF, [2]=EPS, [3]=EDLI, [4]=EE, [5]=EPS, [6]=ER
+                            col_map = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                            for idx, num in enumerate(clean_numbers[:len(col_map)]):
+                                row[col_map[idx]] = num
+                            
+                            all_data.append(row)
+                
+                break  # Found data with this rotation
+    
+    return all_data
+
+
+def extract_ecr_data(pdf_path):
+    """Extract member data from ECR PDF - tries normal extraction first, then OCR."""
+    # Try normal extraction first
+    data = extract_ecr_data_pdfplumber(pdf_path)
+    
+    if data:
+        return data, "normal"
+    
+    # If no data found and OCR is available, try OCR
+    if OCR_AVAILABLE:
+        data = extract_ecr_data_ocr(pdf_path)
+        if data:
+            return data, "ocr"
+    
+    return [], None
+
+
 def convert_ecr_to_excel(pdf_path, output_path):
     """Convert PF ECR PDF to Excel format."""
     
-    data = extract_ecr_data(pdf_path)
+    data, method = extract_ecr_data(pdf_path)
     
     if not data:
-        raise ValueError("No member data found in PDF. Please ensure this is a valid ECR PDF.")
+        if OCR_AVAILABLE:
+            raise ValueError("No member data found in PDF. Please ensure this is a valid ECR PDF.")
+        else:
+            raise ValueError("No member data found. This PDF may require OCR. Please install: pip install pymupdf pytesseract pillow")
     
     wb = Workbook()
     ws = wb.active
@@ -361,11 +465,6 @@ def convert_ecr_to_excel(pdf_path, output_path):
         'EE', 'EPS', 'ER', 'NCP\nDays', 'Refunds', 
         'Pension Share', 'ER PF\nShare', 'EE Share', ''
     ]
-    
-    # PDF column indices: 0=Sl.No, 1=UAN, 4=Gross, 5=EPF, 6=EPS, 7=EDLI,
-    #                     8=EE, 9=EPS, 10=ER, 11=NCPDays, 12=Refunds, 
-    #                     13=PensionShare, 14=ERPFShare, 15=EEShare, 16=PostingLocation
-    # Excel columns:      1=Sl.No, 2=UAN, 3=blank, 4=blank, 5=Gross, 6=EPF, etc.
     
     # Mapping: (pdf_col_index, excel_col_index)
     column_mapping = [
@@ -387,7 +486,6 @@ def convert_ecr_to_excel(pdf_path, output_path):
         (16, 17), # Posting Location
     ]
     
-    # Numeric excel columns (1-indexed)
     numeric_columns = [1, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     
     for col, header in enumerate(headers, start=1):
@@ -397,7 +495,7 @@ def convert_ecr_to_excel(pdf_path, output_path):
     
     for row_idx, row_data in enumerate(data, start=2):
         for pdf_col_idx, excel_col_idx in column_mapping:
-            if pdf_col_idx < len(row_data):
+            if pdf_col_idx < len(row_data) and row_data[pdf_col_idx] is not None:
                 value = row_data[pdf_col_idx]
                 
                 if excel_col_idx in numeric_columns:
@@ -408,7 +506,6 @@ def convert_ecr_to_excel(pdf_path, output_path):
                 cell = ws.cell(row=row_idx, column=excel_col_idx, value=value)
                 cell.alignment = Alignment(horizontal='center' if excel_col_idx <= 2 else 'right')
     
-    # Adjust column widths (now 17 columns)
     column_widths = [8, 14, 8, 8, 8, 8, 8, 8, 6, 6, 6, 8, 8, 12, 10, 10, 6]
     for col, width in enumerate(column_widths, start=1):
         col_letter = chr(64 + col) if col <= 26 else 'A' + chr(64 + col - 26)
@@ -420,44 +517,35 @@ def convert_ecr_to_excel(pdf_path, output_path):
 
 def convert_excel_to_csv(excel_path, output_path):
     """Convert Excel file to CSV format with commas removed from numbers."""
-    # Read Excel file
     df = pd.read_excel(excel_path, header=None)
     
     if df.empty:
         raise ValueError("The Excel file is empty.")
     
-    # Remove commas from all values (for numbers formatted with commas)
     def remove_commas(val):
         if pd.isna(val):
             return val
         val_str = str(val)
-        # Check if it looks like a number with commas (e.g., "1,234" or "# 1,234")
         if ',' in val_str:
-            # Handle special prefix like # for deferred pension
             if val_str.startswith('#'):
                 prefix = '# '
                 num_part = val_str[1:].strip().replace(',', '')
                 return prefix + num_part
             else:
-                # Try to remove commas and convert to number
                 cleaned = val_str.replace(',', '')
                 try:
-                    # Check if it's a valid number after removing commas
                     float(cleaned)
                     return cleaned
                 except ValueError:
                     return val_str
         return val
     
-    # Apply comma removal to all cells (use map for newer pandas, applymap for older)
     if hasattr(df, 'map'):
         df = df.map(remove_commas)
     else:
         df = df.applymap(remove_commas)
     
-    # Save as CSV with UTF-8 encoding
     df.to_csv(output_path, index=False, header=False, encoding='utf-8')
-    
     return len(df)
 
 
@@ -479,7 +567,6 @@ def index():
                 filename = secure_filename(file.filename)
                 file_ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
                 
-                # PDF to Excel conversion
                 if conversion_type == 'pdf_to_excel':
                     if file_ext != 'pdf':
                         error_message = '<div class="alert alert-error">Please upload a PDF file for this conversion.</div>'
@@ -515,7 +602,6 @@ def index():
                                 os.unlink(excel_path)
                             error_message = f'<div class="alert alert-error">Error: {str(e)}</div>'
                 
-                # Excel to CSV conversion
                 elif conversion_type == 'excel_to_csv':
                     if file_ext not in ['xlsx', 'xls']:
                         error_message = '<div class="alert alert-error">Please upload an Excel file (.xlsx or .xls) for this conversion.</div>'
@@ -556,7 +642,6 @@ def index():
 
 
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
@@ -566,6 +651,9 @@ if __name__ == '__main__':
     print("\n  Features:")
     print("  • PDF to Excel (ECR files)")
     print("  • Excel to CSV")
-    print(f"\n  Running on port: {port}")
+    print(f"\n  OCR Support: {'✓ Enabled' if OCR_AVAILABLE else '✗ Disabled'}")
+    print(f"\n  Open your browser and go to:")
+    print(f"  👉  http://localhost:{port}")
+    print("\n  Press Ctrl+C to stop the server")
     print("="*50 + "\n")
     app.run(host='0.0.0.0', port=port, debug=debug)
