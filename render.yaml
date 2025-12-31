@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: pf-ecr-converter
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
